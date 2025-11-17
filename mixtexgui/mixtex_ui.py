@@ -16,15 +16,95 @@ import os
 import csv
 import re
 import ctypes
+import json
+import pynput
 
 if hasattr(sys, '_MEIPASS'):
     base_path = sys._MEIPASS
 else:
     base_path = os.path.abspath(".")
 
+class AreaScreenshots:
+    def __init__(self):
+        self.pic = None
+        self.need_ocr = False
+
+    def _on_mouse_down(self, event):
+        """鼠标按下时记录起始坐标，创建初始选择框"""
+        self.start_x, self.start_y = event.x, event.y
+        # 删除之前的选择框（如果存在）
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+        # 绘制半透明红色选择框（边框红色，填充半透明）
+        self.rect_id = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x, self.start_y,
+            outline="red", width=2, fill="#FF0080"
+        )
+
+    def _on_mouse_drag(self, event):
+        """拖动鼠标时更新选择框的位置"""
+        current_x, current_y = event.x, event.y
+        self.canvas.coords(self.rect_id, self.start_x, self.start_y, current_x, current_y)
+
+    def _on_mouse_up(self, event):
+        """释放鼠标时裁剪并保存选择区域"""
+        end_x, end_y = event.x, event.y
+        # 确保坐标为左上角→右下角（避免反向选择）
+        x1 = min(self.start_x, end_x)
+        y1 = min(self.start_y, end_y)
+        x2 = max(self.start_x, end_x)
+        y2 = max(self.start_y, end_y)
+        self.root.destroy()
+        # 裁剪有效区域并保存
+        if x1 < x2 and y1 < y2:
+            cropped_image = ImageGrab.grab((x1, y1, x2, y2))
+            cropped_image.save("selected_screenshot.png")
+            print(f"✅ 截图已保存为: selected_screenshot.png")
+            self.pic = cropped_image
+            self.need_ocr = True
+        else:
+            print("❌ 未选择有效区域")
+        self.root.quit()
+
+    def do_screenshots(self):
+        # 初始化主窗口（全屏+置顶）
+        self.root = tk.Tk()
+        self.root.state('zoomed')
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
+        self.root.overrideredirect(True)
+        self.root.title("区域截图工具")
+        self.root.attributes('-alpha', 0.5)
+
+        # 创建画布用于显示截图和绘制选择框
+        self.canvas = tk.Canvas(self.root, cursor="cross")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # 绑定鼠标事件
+        self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)  # 按下左键
+        self.canvas.bind("<B1-Motion>", self._on_mouse_drag)      # 拖动鼠标
+        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)  # 释放左键
+
+        # 记录选择区域的坐标
+        self.start_x, self.start_y = 0, 0
+        self.rect_id = None  # 选择框的ID
+
+        self.root.mainloop()
+
 class MixTeXApp:
     def __init__(self, root):
         self.root = root
+
+        self.config = {
+            "screenshot_key":"<ctrl>+<alt>+x"
+        }
+
+        if not os.path.exists("./config.json"):
+            with open("config.json", "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=4)
+        else:
+            with open("config.json", "r", encoding="utf-8") as f:
+                self.config = json.load(f)
         
         # 添加 DPI 感知支持 (解决高分屏模糊问题)
         try:
@@ -44,6 +124,14 @@ class MixTeXApp:
         self.is_only_parse_when_show = False
         self.icon = self.load_scaled_image(os.path.join(base_path, "icon.png"))
         self.icon_tk = ImageTk.PhotoImage(self.icon)
+
+        self.AS_tool = AreaScreenshots()
+        # self.root.bind(config["screenshot_key"], self.AS_tool.do_screenshots)
+
+        # 启动监听线程
+        listener_thread = threading.Thread(target=self.start_listener, daemon=True)
+        listener_thread.start()
+
 
         self.main_frame = tk.Frame(self.root, bg=self.TRANSCOLOUR)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
@@ -109,7 +197,14 @@ class MixTeXApp:
         self.donate_window = None
 
         self.is_only_parse_when_show = False
-    
+
+    def start_listener(self):
+        hotkey = pynput.keyboard.GlobalHotKeys({
+            self.config["screenshot_key"]: self.AS_tool.do_screenshots,
+        })
+        with hotkey:
+            hotkey.join()
+
     def scale_size(self, size):
         """根据DPI缩放尺寸"""
         return int(size * self.dpi_scale)
@@ -280,8 +375,9 @@ class MixTeXApp:
                     
             tokenizer = RobertaTokenizer.from_pretrained(valid_path)
             feature_extractor = ViTImageProcessor.from_pretrained(valid_path)
-            encoder_session = ort.InferenceSession(f"{valid_path}/encoder_model.onnx")
-            decoder_session = ort.InferenceSession(f"{valid_path}/decoder_model_merged.onnx")
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            encoder_session = ort.InferenceSession(f"{valid_path}/encoder_model.onnx",providers=providers)
+            decoder_session = ort.InferenceSession(f"{valid_path}/decoder_model_merged.onnx",providers=providers)
             self.log('\n===成功加载模型===\n')
             return (tokenizer, feature_extractor, encoder_session, decoder_session)
         except Exception as e:
@@ -440,9 +536,14 @@ class MixTeXApp:
 
     def ocr_loop(self):
         while True:
-            if not self.ocr_paused and (self.tray_icon.visible or not self.is_only_parse_when_show):
+            if not self.ocr_paused and (self.tray_icon.visible or not self.is_only_parse_when_show \
+                                        or self.AS_tool.need_ocr):
                 try:
-                    image = ImageGrab.grabclipboard()
+                    if(self.AS_tool.need_ocr):
+                        image = self.AS_tool.pic
+                    else:
+                        image = ImageGrab.grabclipboard()
+                    self.AS_tool.need_ocr = False
                     if image is not None and type(image) != list:
                         self.current_image = self.pad_image(image.convert("RGB"), (448,448))
                         result = self.mixtex_inference(512, 3, 768, 12, 1)
